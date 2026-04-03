@@ -1,169 +1,154 @@
 const express = require('express');
 const cors = require('cors');
-const puppeteer = require('puppeteer-core');
-const chromium = require('@sparticuz/chromium');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-async function scrapeProduct(url) {
-  let browser;
+// ── ZARA API ──
+async function scrapeZara(url) {
   try {
-    browser = await puppeteer.launch({
-      args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'],
-      defaultViewport: { width: 1280, height: 900 },
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
+    const match = url.match(/p(\d+)/);
+    if (!match) return null;
+    const productId = match[1];
+    const colorMatch = url.match(/v1=(\d+)/);
+    const colorId = colorMatch ? colorMatch[1] : null;
+
+    const apiUrl = `https://www.zara.com/us/en/product/${productId}/extra-detail`;
+    const res = await fetch(apiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://www.zara.com/',
+      }
     });
 
-    const page = await browser.newPage();
+    if (!res.ok) return null;
+    const data = await res.json();
 
-    // Hide automation signals
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      window.chrome = { runtime: {} };
-    });
+    const name = data?.name || data?.displayName || null;
+    const price = data?.price ? `$${(data.price / 100).toFixed(0)}` : null;
 
-    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36');
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    });
-
-    // Intercept JSON API responses that might contain product data
-    let productData = {};
-    page.on('response', async response => {
-      try {
-        const respUrl = response.url();
-        const ct = response.headers()['content-type'] || '';
-        if (ct.includes('json') && (
-          respUrl.includes('product') ||
-          respUrl.includes('pdp') ||
-          respUrl.includes('item') ||
-          respUrl.includes('catalog')
-        )) {
-          const json = await response.json();
-          // Try to extract common product fields from API response
-          const flat = JSON.stringify(json);
-          if (flat.includes('price') || flat.includes('name')) {
-            productData = { ...productData, _raw: json };
-          }
-        }
-      } catch {}
-    });
-
-    // Try with shorter timeout and domcontentloaded
-    try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    } catch {
-      // If navigation times out, try to extract what we have
+    let image = null;
+    const colors = data?.detail?.colors || data?.colors || [];
+    const selectedColor = colorId ? colors.find(c => c.id == colorId) : colors[0];
+    if (selectedColor?.xmedia?.[0]) {
+      const media = selectedColor.xmedia[0];
+      image = `https://static.zara.net/assets${media.path}/${media.name}-p.jpg?ts=${media.timestamp}&w=750`;
     }
-    await new Promise(r => setTimeout(r, 3000));
 
-    const data = await page.evaluate(() => {
-      // ── NAME ──
-      const nameSelectors = [
-        'h1',
-        '[class*="product-name"]',
-        '[class*="product-title"]',
-        '[data-testid*="product-name"]',
-        '[data-testid*="title"]',
-        '.pdp-title',
-        '.product__title',
-        '[itemprop="name"]',
-      ];
-      let name = null;
-      for (const sel of nameSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim().length > 2 && !el.textContent.includes('www.')) {
-          name = el.textContent.trim();
-          break;
-        }
-      }
-
-      // ── PRICE ──
-      const priceSelectors = [
-        '[itemprop="price"]',
-        '[class*="product-price"]:not([class*="was"]):not([class*="original"])',
-        '[class*="price"]:not([class*="was"]):not([class*="original"]):not([class*="compare"])',
-        '[data-testid*="price"]',
-        '.price',
-        '.product__price',
-      ];
-      let price = null;
-      for (const sel of priceSelectors) {
-        const el = document.querySelector(sel);
-        if (el) {
-          const text = el.getAttribute('content') || el.textContent.trim();
-          const match = text.match(/[\$£€]\s?[\d,]+\.?\d{0,2}/);
-          if (match) { price = match[0]; break; }
-        }
-      }
-
-      // ── IMAGE ── try og:image first (most reliable)
-      let image = null;
-      const ogImg = document.querySelector('meta[property="og:image"]');
-      if (ogImg) image = ogImg.getAttribute('content');
-
-      if (!image) {
-        const imgSelectors = [
-          '[class*="product-image"] img',
-          '[class*="product-media"] img',
-          '[class*="pdp"] img',
-          '[class*="gallery"] img',
-          'main img',
-          '[data-testid*="image"] img',
-        ];
-        for (const sel of imgSelectors) {
-          const el = document.querySelector(sel);
-          if (el && el.src && !el.src.includes('logo') && !el.src.includes('icon')) {
-            image = el.src;
-            break;
-          }
-        }
-      }
-
-      // ── COLOR ──
-      const colorSelectors = [
-        '[class*="color-name"]',
-        '[class*="colour-name"]',
-        '[class*="swatch-label"]',
-        '[data-testid*="color"]',
-        '[class*="selected-color"]',
-      ];
-      let color = null;
-      for (const sel of colorSelectors) {
-        const el = document.querySelector(sel);
-        if (el && el.textContent.trim() && !/^\d+$/.test(el.textContent.trim())) {
-          color = el.textContent.trim();
-          break;
-        }
-      }
-
-      // ── OG fallbacks ──
-      if (!name) {
-        const ogTitle = document.querySelector('meta[property="og:title"]');
-        if (ogTitle) name = ogTitle.getAttribute('content');
-      }
-
-      return { name, price, image, color };
-    });
-
-    return data;
-  } finally {
-    if (browser) await browser.close();
+    const color = selectedColor?.name || null;
+    return { name, price, image, color };
+  } catch (err) {
+    console.error('Zara API error:', err.message);
+    return null;
   }
 }
 
+// ── ARITZIA API ──
+async function scrapeAritzia(url) {
+  try {
+    const match = url.match(/\/(\d+)\.html/);
+    if (!match) return null;
+    const productId = match[1];
+    const colorMatch = url.match(/color=(\d+)/);
+    const colorId = colorMatch ? colorMatch[1] : null;
+
+    const apiUrl = `https://www.aritzia.com/api/product/getproduct?productId=${productId}`;
+    const res = await fetch(apiUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+        'Accept': 'application/json',
+        'Referer': 'https://www.aritzia.com/',
+        'x-requested-with': 'XMLHttpRequest',
+      }
+    });
+
+    if (!res.ok) return null;
+    const data = await res.json();
+
+    const name = data?.product?.name || data?.name || null;
+    const priceRaw = data?.product?.price || data?.price || null;
+    const price = priceRaw ? `$${priceRaw}` : null;
+
+    let image = null;
+    const images = data?.product?.images || data?.images || [];
+    if (images.length > 0) image = images[0]?.url || images[0]?.src || null;
+
+    const colors = data?.product?.variants || data?.variants || [];
+    const selectedColor = colorId ? colors.find(c => c.colorId == colorId) : colors[0];
+    const color = selectedColor?.colorName || null;
+
+    return { name, price, image, color };
+  } catch (err) {
+    console.error('Aritzia API error:', err.message);
+    return null;
+  }
+}
+
+// ── GENERIC FALLBACK via og tags ──
+async function scrapeGeneric(url) {
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+      }
+    });
+    const html = await res.text();
+
+    const getOg = (tag) => {
+      const m = html.match(new RegExp(`<meta[^>]+property=["']og:${tag}["'][^>]+content=["']([^"']+)["']`, 'i'))
+        || html.match(new RegExp(`<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:${tag}["']`, 'i'));
+      return m ? m[1] : null;
+    };
+
+    const getPriceMeta = () => {
+      const patterns = [
+        /<meta[^>]+property=["']product:price:amount["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+name=["']price["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+itemprop=["']price["'][^>]+content=["']([^"']+)["']/i,
+      ];
+      for (const p of patterns) {
+        const m = html.match(p);
+        if (m) return m[1];
+      }
+      return null;
+    };
+
+    const name = getOg('title');
+    const image = getOg('image');
+    const priceRaw = getPriceMeta();
+    const price = priceRaw ? `$${parseFloat(priceRaw).toFixed(0)}` : null;
+
+    return { name, price, image, color: null };
+  } catch (err) {
+    console.error('Generic scrape error:', err.message);
+    return null;
+  }
+}
+
+// ── MAIN HANDLER ──
 app.get('/scrape', async (req, res) => {
   const { url } = req.query;
   if (!url) return res.status(400).json({ error: 'url parameter required' });
+
   try {
-    const data = await scrapeProduct(url);
-    res.json({ success: true, data });
+    let data = null;
+    const domain = new URL(url).hostname;
+
+    if (domain.includes('zara.com')) {
+      data = await scrapeZara(url);
+    } else if (domain.includes('aritzia.com')) {
+      data = await scrapeAritzia(url);
+    }
+
+    if (!data || (!data.name && !data.price && !data.image)) {
+      data = await scrapeGeneric(url);
+    }
+
+    res.json({ success: true, data: data || {} });
   } catch (err) {
     console.error('Scrape error:', err.message);
     res.json({ success: false, data: {}, error: err.message });
